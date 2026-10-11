@@ -190,7 +190,8 @@ public:
             allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory depth plane copy");
             Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory depth plane copy");
-            staging = std::make_unique<DeviceBuffer>(context, static_cast<std::size_t>(sliceBytes()) * layers, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            stagingSize = static_cast<std::size_t>(sliceBytes()) * layers;
+            staging = std::make_unique<DeviceBuffer>(context, stagingSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         } catch (...) {
             release();
             throw;
@@ -203,7 +204,18 @@ public:
     std::shared_ptr<Texture> Refresh(std::span<const VkImage> slices, const GuestTextureResource& resource, VkComponentMapping components, VkImageViewType viewType) {
         Require(slices.size() == layers, "depth plane copy slices do not match its layers");
         const auto geometry = DescribeSurface(resource);
-        Require(geometry.layers == layers && geometry.sliceLinearBytes == sliceBytes() && !geometry.mips.empty(), "depth plane copy geometry does not match its layers");
+        if (geometry.layers != layers || geometry.sliceLinearBytes < sliceBytes() || geometry.mips.empty()) {
+            char text[320];
+            std::snprintf(text, sizeof(text), "AGC graphics: depth plane copy geometry does not match its layers (copy %ux%u, %u layers, %llu bytes a slice; texture %ux%u guest format %u, dimension %d, tile mode %u, %u layers, %llu bytes a slice, %zu mips)", extent.width, extent.height, layers, static_cast<unsigned long long>(sliceBytes()), resource.width, resource.height, resource.format, static_cast<int>(resource.dimension), resource.tileMode, geometry.layers, static_cast<unsigned long long>(geometry.sliceLinearBytes), geometry.mips.size());
+            throw std::runtime_error(text);
+        }
+        const auto stagingBytes = static_cast<std::size_t>(geometry.sliceLinearBytes) * layers;
+        if (stagingBytes > stagingSize) {
+            retiredStaging.push_back(std::move(staging));
+            staging = std::make_unique<DeviceBuffer>(context, stagingBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            stagingSize = stagingBytes;
+        }
+        const auto& mip = geometry.mips.front();
         std::vector<std::shared_ptr<Buffer>> uploads;
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
             if (slices[layer] != VK_NULL_HANDLE) continue;
@@ -224,7 +236,8 @@ public:
         std::vector<VkBufferImageCopy> regions(layers);
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
             auto& region = regions[layer];
-            region.bufferOffset = sliceBytes() * layer;
+            region.bufferOffset = geometry.LinearLayerOffset(layer) + mip.linearOffset;
+            region.bufferRowLength = mip.pitchBytes / (format == VK_FORMAT_D32_SFLOAT ? 4u : 2u);
             region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
             region.imageExtent = {extent.width, extent.height, 1};
             if (slices[layer] != VK_NULL_HANDLE) context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, slices[layer], VK_IMAGE_LAYOUT_GENERAL, staging->Handle(), 1, &region);
@@ -280,6 +293,8 @@ private:
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     std::unique_ptr<DeviceBuffer> staging;
+    std::size_t stagingSize = 0;
+    std::vector<std::unique_ptr<DeviceBuffer>> retiredStaging;
     std::map<std::array<std::uint32_t, 5>, std::shared_ptr<Texture>> textures;
 
     VkDeviceSize sliceBytes() const {

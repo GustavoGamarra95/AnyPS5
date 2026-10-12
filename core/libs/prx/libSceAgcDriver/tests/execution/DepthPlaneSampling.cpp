@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -49,6 +50,7 @@ constexpr std::size_t ArrayOffset = 0x10000;
 constexpr std::size_t CubeOffset = 0x40000;
 constexpr std::size_t IntegerOffset = 0xa0000;
 constexpr std::size_t DepthBitsOffset = 0xb0000;
+constexpr std::size_t SmallCubeOffset = 0x100000;
 constexpr float DrawnDepth = 0.25f;
 constexpr float DrawnD16Depth = 0.2f;
 constexpr std::uint32_t DrawnD16Bits = 13107;
@@ -194,7 +196,7 @@ void DrawDepth(AgcDriver::VulkanDevice& device, std::uint64_t address, VkExtent2
     }};
     AgcDriver::Graphics::State state{};
     state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0u, 32u, 32u, std::nullopt, std::nullopt};
-    state.color = {reinterpret_cast<std::uintptr_t>(Pixels.data()), extent, VK_FORMAT_R8G8B8A8_UNORM, static_cast<std::size_t>(extent.width) * extent.height * 4u, 0xe4u};
+    state.color = {reinterpret_cast<std::uintptr_t>(Pixels.data()), extent, VK_FORMAT_R8G8B8A8_UNORM, AgcDriver::Graphics::ColorTargetLayout(extent.width, extent.height, AgcDriver::Graphics::ColorTileMode::Linear).Bytes(), 0xe4u};
     state.colors = {state.color};
     state.hasColorTarget = true;
     state.depth = AgcDriver::Graphics::DepthTarget{address, 0, extent, format, 1.0f, 0};
@@ -298,6 +300,17 @@ void DepthBitsArrayCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std:
     Expect(output, 0x1234u, "D16 depth-bits array slice 1");
 }
 
+void SmallD16CubeCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
+    auto* base = block.At(SmallCubeOffset);
+    DrawDepth(device, reinterpret_cast<std::uintptr_t>(base), {32, 32}, VK_FORMAT_D16_UNORM, DrawnD16Depth);
+    for (std::uint32_t face = 1; face < 6u; ++face) FillSlice(base + face * SliceBytes, SliceBytes, 0x1230u + face, 2u);
+    const Shape shape{Format16Uint, 32, 32, TypeCube, 0, Swizzle64KbZX};
+    for (std::uint32_t face = 0; face < 6u; ++face) {
+        Load(device, base, shape, face, output);
+        Expect(output, face == 0 ? DrawnD16Bits : 0x1230u + face, "small D16 cube face " + std::to_string(face));
+    }
+}
+
 // A plane array from a later base slice is still refused (its slice offsets are not modeled here).
 void RefusalCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
     bool refused = false;
@@ -324,6 +337,7 @@ int main() {
         CubeCase(*device, block, output);
         IntegerCase(*device, block, output);
         DepthBitsArrayCase(*device, block, output);
+        SmallD16CubeCase(*device, block, output);
         RefusalCase(*device, block, output);
         std::puts("depth plane sampling tests passed");
         return 0;
